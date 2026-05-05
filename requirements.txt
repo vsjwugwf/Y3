@@ -1,8 +1,5 @@
 requests
-yt-dlp
 scrapetube
-python-telegram-bot
-innertube
-youtube-search-python
-duckduckgo-search
-pytubefix
+beautifulsoup4
+playwright
+yt-dlp
