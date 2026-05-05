@@ -2,4 +2,3 @@ requests
 scrapetube
 beautifulsoup4
 playwright
-yt-dlp
