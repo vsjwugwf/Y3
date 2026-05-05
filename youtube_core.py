@@ -1,20 +1,35 @@
 """
-youtube_core.py - هسته اصلی عملیات یوتیوب (جستجو، دانلود، اطلاعات)
-شامل 12 متد API با موتور fallback هوشمند.
-نسخه نهایی: رفع کامل باگ y2mate و view_count در piped.
+youtube_core.py - هسته اصلی عملیات یوتیوب (نسخه ۳)
+شامل جستجوی مرورگری با Playwright، جستجوی API با scrapetube،
+غنی‌سازی اطلاعات با چندین روش، دانلود با سه API پروکسی و موتور fallback.
 """
 
 import os
 import time
+import re
+import math
+import json
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
+from urllib.parse import quote_plus
 
+# کتابخانه‌های داخلی پروژه
 import settings
-from utils import get_logger, download_file, extract_video_id
+from utils import get_logger, download_file as utils_download_file, extract_video_id
+
+# تلاش برای import کتابخانه‌های خارجی (در صورت عدم وجود، متدها None برمی‌گردانند)
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None  # مدیریت در متدهای مربوطه
+
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
 
 _log = get_logger("youtube_core")
-
 
 # ═══════════════════════════════════════════════════════════
 # موتور fallback
@@ -26,8 +41,8 @@ def run_with_fallback(
     **kwargs
 ) -> Tuple[Any, Optional[str]]:
     """
-    متدهای یک زنجیره را به ترتیب صدا می‌زند؛ اولین موفقیت را برمی‌گرداند.
-    اگر start_method داده شود، فقط از آن متد به بعد تلاش می‌کند.
+    متدهای یک زنجیره را به ترتیب اجرا می‌کند؛
+    اولین موفقیت (نتیجه غیر None) را برمی‌گرداند.
     """
     if not chain:
         return None, None
@@ -44,7 +59,6 @@ def run_with_fallback(
         try:
             result = operation_func(method, kwargs)
             if result is not None:
-                # لیست خالی یعنی متد کار کرد ولی نتیجه‌ای نیافت
                 if isinstance(result, list) and len(result) == 0:
                     _log.debug(f"متد {method} نتیجه خالی برگرداند، ادامه...")
                     continue
@@ -56,60 +70,14 @@ def run_with_fallback(
 
 
 # ═══════════════════════════════════════════════════════════
-# helper‌ها
+# توابع کمکی
 # ═══════════════════════════════════════════════════════════
-def _parse_innertube_renderer(data: dict, limit: int) -> List[Dict]:
-    """تجزیه پاسخ جستجوی innertube و استخراج videoRendererها."""
-    results = []
-    try:
-        contents = data.get("contents", {})
-        # ساختار کلاسیک
-        two_col = contents.get("twoColumnSearchResultsRenderer", {})
-        primary = two_col.get("primaryContents", {})
-        sections = primary.get("sectionListRenderer", {}).get("contents", [])
-        for section in sections:
-            items = section.get("itemSectionRenderer", {}).get("contents", [])
-            for item in items:
-                video = item.get("videoRenderer")
-                if video:
-                    results.append(_extract_video_from_renderer(video))
-                    if len(results) >= limit:
-                        return results
-        # ساختار rich grid جدید
-        if not results:
-            rich = contents.get("richGridRenderer", {}).get("contents", [])
-            for item in rich:
-                video = item.get("richItemRenderer", {}).get("content", {}).get("videoRenderer")
-                if video:
-                    results.append(_extract_video_from_renderer(video))
-                    if len(results) >= limit:
-                        return results
-    except Exception as e:
-        _log.error(f"خطا در تجزیه innertube: {e}")
-    return results[:limit]
-
-
-def _extract_video_from_renderer(renderer: dict) -> dict:
-    """استخراج فیلدهای اصلی از یک videoRenderer."""
-    video_id = renderer.get("videoId", "")
-    title_runs = renderer.get("title", {}).get("runs", [{}])
-    title = "".join(run.get("text", "") for run in title_runs) if title_runs else ""
-    thumb = renderer.get("thumbnail", {}).get("thumbnails", [{}])
-    thumb_url = thumb[0].get("url", "") if thumb else ""
-    duration = renderer.get("lengthText", {}).get("simpleText", "")
-    uploader_runs = renderer.get("ownerText", {}).get("runs", [{}])
-    uploader = "".join(run.get("text", "") for run in uploader_runs) if uploader_runs else ""
-    return {
-        "video_id": video_id,
-        "title": title,
-        "duration": duration,
-        "thumbnail_url": thumb_url,
-        "uploader": uploader
-    }
-
+def _extract_video_id_from_url(url: str) -> Optional[str]:
+    """استخراج شناسه ۱۱ نویسه‌ای از URLهای یوتیوب."""
+    return extract_video_id(url)
 
 def _find_downloaded_file(video_id: str, save_dir: str, ext: str = ".mp4") -> Optional[str]:
-    """پیدا کردن فایل دانلود شده با پیشوند video_id و پسوند ext."""
+    """جستجوی فایل دانلودشده با پیشوند video_id."""
     if not os.path.isdir(save_dir):
         return None
     for fname in os.listdir(save_dir):
@@ -119,114 +87,93 @@ def _find_downloaded_file(video_id: str, save_dir: str, ext: str = ".mp4") -> Op
 
 
 # ═══════════════════════════════════════════════════════════
-# متدهای جستجو (Search)
+# جستجوی مرورگری با Playwright
 # ═══════════════════════════════════════════════════════════
-def _search_simatwa_search(query: str, limit: int) -> Optional[List[Dict]]:
-    """Simatwa Search API (نیازمند نمونه در حال اجرا)"""
-    base = getattr(settings, "SIMATWA_API_BASE", None)
-    if not base:
-        _log.warning("SIMATWA_API_BASE تنظیم نشده. متد simatwa_search رد می‌شود.")
+def _search_browser(query: str, limit: int = 10) -> Optional[List[Dict]]:
+    """
+    جستجوی یوتیوب با مرورگر headless (Playwright).
+    اطلاعات پایه را از صفحه نتایج استخراج می‌کند.
+    """
+    if sync_playwright is None:
+        _log.warning("Playwright نصب نیست. جستجوی مرورگری غیرفعال است.")
         return None
+
+    _log.info(f"شروع جستجوی مرورگری: {query}")
     try:
-        resp = requests.get(
-            f"{base}/api/search",
-            params={"q": query, "limit": limit},
-            timeout=settings.REQUEST_TIMEOUT
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("items", [])
-        results = []
-        for item in items[:limit]:
-            results.append({
-                "video_id": item.get("id", ""),
-                "title": item.get("title", ""),
-                "duration": item.get("duration", 0),
-                "thumbnail_url": item.get("thumbnail", ""),
-                "uploader": item.get("uploader", "")
-            })
-        return results
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
+            context = browser.new_context(
+                user_agent=settings.USER_AGENT,
+                viewport={"width": 390, "height": 844}  # شبیه‌سازی موبایل برای DOM ساده‌تر
+            )
+            page = context.new_page()
+            try:
+                # پیمایش به صفحه جستجو
+                search_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+                page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                # صبر برای بارگذاری نتایج
+                page.wait_for_selector("ytd-video-renderer", timeout=15000)
+                page.wait_for_timeout(2000)  # اطمینان از رندر کامل
+
+                # استخراج اطلاعات از DOM با جاوااسکریپت
+                results = page.evaluate("""(limit) => {
+                    const items = document.querySelectorAll('ytd-video-renderer');
+                    const videos = [];
+                    for (const item of items) {
+                        if (videos.length >= limit) break;
+                        try {
+                            const titleEl = item.querySelector('#video-title');
+                            const title = titleEl ? (titleEl.getAttribute('aria-label') || titleEl.textContent.trim()) : '';
+                            const href = titleEl ? titleEl.getAttribute('href') : '';
+                            const videoId = href ? new URL(href, location.origin).searchParams.get('v') : '';
+
+                            const thumbImg = item.querySelector('#img, yt-image img, img.yt-core-image');
+                            const thumbnail = thumbImg ? (thumbImg.src || thumbImg.getAttribute('src')) : '';
+
+                            const timeStatus = item.querySelector('ytd-thumbnail-overlay-time-status-renderer #text');
+                            const duration = timeStatus ? timeStatus.textContent.trim() : '';
+
+                            const channelEl = item.querySelector('ytd-channel-name a');
+                            const uploader = channelEl ? channelEl.textContent.trim() : '';
+
+                            if (videoId) {
+                                videos.push({
+                                    video_id: videoId,
+                                    title: title,
+                                    duration: duration,
+                                    thumbnail_url: thumbnail,
+                                    uploader: uploader
+                                });
+                            }
+                        } catch(e) {}
+                    }
+                    return videos;
+                }""", limit)
+
+                _log.info(f"جستجوی مرورگری {len(results)} نتیجه برگرداند.")
+                # افزودن فیلدهای خالی برای غنی‌سازی بعدی
+                for r in results:
+                    r.setdefault("view_count", None)
+                    r.setdefault("like_count", None)
+                    r.setdefault("description", None)
+                return results
+            finally:
+                page.close()
+                context.close()
+                browser.close()
     except Exception as e:
-        _log.error(f"simatwa_search failed: {e}")
+        _log.error(f"search_browser failed: {e}")
         return None
 
 
-def _search_samzong(query: str, limit: int) -> Optional[List[Dict]]:
-    """samzong yt-search-api (عمومی یا خودمیزبان)"""
-    base = getattr(settings, "SAMZONG_API_BASE", "https://yt-search-api-sable.vercel.app")
-    token = getattr(settings, "SAMZONG_API_TOKEN", None)
-    headers = {"User-Agent": settings.USER_AGENT}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        resp = requests.get(
-            f"{base}/search",
-            params={"platform": "youtube", "q": query},
-            headers=headers,
-            timeout=settings.REQUEST_TIMEOUT
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("items", [])
-        results = []
-        for item in items[:limit]:
-            results.append({
-                "video_id": item.get("videoId", ""),
-                "title": item.get("title", ""),
-                "duration": None,               # این API مدت زمان ندارد
-                "thumbnail_url": item.get("thumbnailUrl", ""),
-                "uploader": item.get("uploader", "")
-            })
-        return results
-    except Exception as e:
-        _log.error(f"samzong search failed: {e}")
-        return None
-
-
-def _search_piped(query: str, limit: int) -> Optional[List[Dict]]:
-    """Piped API عمومی"""
-    try:
-        resp = requests.get(
-            "https://pipedapi.kavin.rocks/search",
-            params={"q": query, "filter": "videos"},
-            timeout=settings.REQUEST_TIMEOUT
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        items = [i for i in data.get("items", []) if i.get("type") == "video"]
-        results = []
-        for item in items[:limit]:
-            results.append({
-                "video_id": item.get("videoId", ""),
-                "title": item.get("title", ""),
-                "duration": item.get("duration", 0),
-                "thumbnail_url": item.get("thumbnail", ""),
-                "uploader": item.get("uploaderName", "")
-            })
-        return results
-    except Exception as e:
-        _log.error(f"piped search failed: {e}")
-        return None
-
-
-def _search_innertube2(query: str, limit: int) -> Optional[List[Dict]]:
-    """InnerTube v2 (کتابخانه innertube)"""
-    try:
-        from innertube import InnerTube
-    except ImportError:
-        _log.warning("innertube library نصب نیست. متد innertube2 رد می‌شود.")
-        return None
-    try:
-        client = InnerTube("WEB")
-        data = client.search(query)
-        return _parse_innertube_renderer(data, limit)
-    except Exception as e:
-        _log.error(f"innertube2 search failed: {e}")
-        return None
-
-
-def _search_scrapetube(query: str, limit: int) -> Optional[List[Dict]]:
-    """scrapetube (فقط شناسه ویدئوها)"""
+# ═══════════════════════════════════════════════════════════
+# جستجوی API با scrapetube
+# ═══════════════════════════════════════════════════════════
+def _search_scrapetube(query: str, limit: int = 10) -> Optional[List[Dict]]:
+    """جستجو با scrapetube (فقط شناسه ویدئوها)."""
     try:
         import scrapetube
     except ImportError:
@@ -242,7 +189,10 @@ def _search_scrapetube(query: str, limit: int) -> Optional[List[Dict]]:
                 "title": None,
                 "duration": None,
                 "thumbnail_url": f"https://img.youtube.com/vi/{vid}/mqdefault.jpg",
-                "uploader": None
+                "uploader": None,
+                "view_count": None,
+                "like_count": None,
+                "description": None
             })
         return results
     except Exception as e:
@@ -251,10 +201,223 @@ def _search_scrapetube(query: str, limit: int) -> Optional[List[Dict]]:
 
 
 # ═══════════════════════════════════════════════════════════
-# متدهای دانلود (Download)
+# متدهای غنی‌سازی اطلاعات ویدئو
 # ═══════════════════════════════════════════════════════════
-def _download_hubytconvert(video_id: str, save_dir: str) -> Optional[str]:
-    """hub.ytconvert.org (مطمئن‌ترین متد)"""
+def _enrich_oembed(video_id: str) -> Optional[Dict]:
+    """دریافت اطلاعات پایه از oEmbed."""
+    url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+    try:
+        resp = requests.get(url, timeout=settings.REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "title": data.get("title"),
+            "uploader": data.get("author_name"),
+            "thumbnail_url": data.get("thumbnail_url"),
+        }
+    except Exception as e:
+        _log.error(f"oembed enrichment failed: {e}")
+        return None
+
+def _enrich_json_ld(video_id: str) -> Optional[Dict]:
+    """استخراج structured data از صفحه ویدیو (بدون مرورگر)."""
+    if BeautifulSoup is None:
+        return None
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        resp = requests.get(url, headers={"User-Agent": settings.USER_AGENT}, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        script_tag = soup.find("script", type="application/ld+json")
+        if not script_tag:
+            return None
+        data = json.loads(script_tag.string)
+        # استخراج فیلدها
+        result = {}
+        if "name" in data:
+            result["title"] = data["name"]
+        if "description" in data:
+            result["description"] = data["description"]
+        if "thumbnailUrl" in data:
+            result["thumbnail_url"] = data["thumbnailUrl"]
+        if "uploadDate" in data:
+            result["upload_date"] = data["uploadDate"]
+        if "author" in data and "name" in data["author"]:
+            result["uploader"] = data["author"]["name"]
+        # آمار تعامل
+        if "interactionStatistic" in data:
+            for stat in data["interactionStatistic"]:
+                if stat.get("interactionType") == "http://schema.org/WatchAction":
+                    result.setdefault("view_count", stat.get("userInteractionCount"))
+                elif stat.get("interactionType") == "http://schema.org/LikeAction":
+                    result.setdefault("like_count", stat.get("userInteractionCount"))
+        # تبدیل مدت زمان iso8601 به ثانیه
+        if "duration" in data:
+            dur = data["duration"]  # e.g. "PT1H2M10S"
+            try:
+                match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', dur)
+                if match:
+                    hours = int(match.group(1) or 0)
+                    minutes = int(match.group(2) or 0)
+                    seconds = int(match.group(3) or 0)
+                    result["duration"] = hours * 3600 + minutes * 60 + seconds
+            except Exception:
+                pass
+        return result if result else None
+    except Exception as e:
+        _log.error(f"JSON-LD enrichment failed: {e}")
+        return None
+
+def _enrich_dom_watch_page(video_id: str) -> Optional[Dict]:
+    """بازکردن صفحه ویدیو با Playwright و استخراج اطلاعات (JSON-LD یا ytInitialPlayerResponse)."""
+    if sync_playwright is None:
+        return None
+    _log.info(f"DOM watch page enrichment for {video_id}")
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
+            context = browser.new_context(user_agent=settings.USER_AGENT)
+            page = context.new_page()
+            try:
+                page.goto(f"https://www.youtube.com/watch?v={video_id}", wait_until="domcontentloaded", timeout=30000)
+                # تلاش برای دریافت داده‌های ساخت‌یافته
+                try:
+                    # ابتدا سعی کنیم JSON-LD را با جاوااسکریپت استخراج کنیم
+                    ld_json = page.evaluate("""() => {
+                        const el = document.querySelector('script[type="application/ld+json"]');
+                        return el ? el.textContent : null;
+                    }""")
+                    if ld_json:
+                        data = json.loads(ld_json)
+                        # پردازش مشابه _enrich_json_ld
+                        result = {}
+                        if "name" in data:
+                            result["title"] = data["name"]
+                        if "description" in data:
+                            result["description"] = data["description"]
+                        if "thumbnailUrl" in data:
+                            result["thumbnail_url"] = data["thumbnailUrl"]
+                        if "uploadDate" in data:
+                            result["upload_date"] = data["uploadDate"]
+                        if "author" in data and "name" in data["author"]:
+                            result["uploader"] = data["author"]["name"]
+                        if "interactionStatistic" in data:
+                            for stat in data["interactionStatistic"]:
+                                if stat.get("interactionType") == "http://schema.org/WatchAction":
+                                    result.setdefault("view_count", stat.get("userInteractionCount"))
+                                elif stat.get("interactionType") == "http://schema.org/LikeAction":
+                                    result.setdefault("like_count", stat.get("userInteractionCount"))
+                        if "duration" in data:
+                            dur = data["duration"]
+                            try:
+                                match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', dur)
+                                if match:
+                                    hours = int(match.group(1) or 0)
+                                    minutes = int(match.group(2) or 0)
+                                    seconds = int(match.group(3) or 0)
+                                    result["duration"] = hours * 3600 + minutes * 60 + seconds
+                            except Exception:
+                                pass
+                        if result:
+                            return result
+                except Exception:
+                    pass
+
+                # fallback: استخراج از ytInitialPlayerResponse
+                try:
+                    details = page.evaluate("""() => {
+                        if (window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.videoDetails) {
+                            return window.ytInitialPlayerResponse.videoDetails;
+                        }
+                        return null;
+                    }""")
+                    if details:
+                        result = {
+                            "title": details.get("title"),
+                            "duration": int(details.get("lengthSeconds", 0)) or None,
+                            "uploader": details.get("author"),
+                            "view_count": int(details.get("viewCount", 0)) or None,
+                            "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+                        }
+                        return result
+                except Exception:
+                    pass
+                return None
+            finally:
+                page.close()
+                context.close()
+                browser.close()
+    except Exception as e:
+        _log.error(f"DOM watch page enrichment failed: {e}")
+        return None
+
+
+def enrich_video_info(video_id: str, methods: Optional[List[str]] = None) -> Dict:
+    """
+    غنی‌سازی اطلاعات یک ویدئو با استفاده از روش‌های مختلف.
+    خروجی: دیکشنری با کلیدهای video_id, title, duration, view_count, like_count,
+            thumbnail_url, uploader, description, upload_date.
+    """
+    final_info = {"video_id": video_id}
+    if methods is None:
+        # استفاده از همه متدهای فعال تعریف‌شده در settings
+        methods = list(settings.ENRICHMENT_METHODS.keys())
+    # فیلدهایی که هر متد می‌تواند پر کند
+    # ترتیب اولویت: oembed سریع است، json_ld کامل‌تر، dom_watch_page عمیق‌تر
+    for method in methods:
+        if method == "dom_search_page":
+            continue  # فقط در صفحه جستجو کاربرد دارد
+        enrich_func = {
+            "oembed_enrich": _enrich_oembed,
+            "json_ld": _enrich_json_ld,
+            "dom_watch_page": _enrich_dom_watch_page,
+        }.get(method)
+        if not enrich_func:
+            continue
+        try:
+            data = enrich_func(video_id)
+            if data:
+                # ادغام با حفظ داده‌های قبلی (متدهای بعدی در صورت وجود، بازنویسی نمی‌کنند مگر اینکه فیلد جدید خالی باشد)
+                for key, value in data.items():
+                    if value is not None:
+                        final_info[key] = value
+        except Exception as e:
+            _log.error(f"{method} enrichment failed: {e}")
+    return final_info
+
+
+# ═══════════════════════════════════════════════════════════
+# دانلود تصویر بند‌انگشتی
+# ═══════════════════════════════════════════════════════════
+def download_thumbnail(video_id: str, save_dir: str) -> Tuple[Optional[str], str]:
+    """
+    دانلود با کیفیت‌های maxresdefault, sddefault, hqdefault, mqdefault.
+    بازگشت (مسیر فایل, "direct").
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    qualities = ["maxresdefault.jpg", "sddefault.jpg", "hqdefault.jpg", "mqdefault.jpg"]
+    for quality in qualities:
+        thumb_url = f"https://img.youtube.com/vi/{video_id}/{quality}"
+        try:
+            head = requests.head(thumb_url, timeout=5)
+            if head.status_code == 200:
+                fname = f"{video_id}_thumb.jpg"
+                path = utils_download_file(thumb_url, save_dir, fname, timeout=30)
+                if path:
+                    return path, "direct"
+        except Exception:
+            continue
+    return None, "direct"
+
+
+# ═══════════════════════════════════════════════════════════
+# متدهای دانلود
+# ═══════════════════════════════════════════════════════════
+def _download_hubytconvert(video_id: str, save_dir: str, quality: str = "720p") -> Optional[str]:
+    """دانلود از hub.ytconvert.org (مطمئن‌ترین)."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     headers = {
         "User-Agent": settings.USER_AGENT,
@@ -275,7 +438,7 @@ def _download_hubytconvert(video_id: str, save_dir: str) -> Optional[str]:
             json={
                 "url": url,
                 "os": "linux",
-                "output": {"type": "video", "format": "mp4", "quality": "720p"}
+                "output": {"type": "video", "format": "mp4", "quality": quality}
             },
             headers=headers,
             timeout=settings.REQUEST_TIMEOUT
@@ -300,8 +463,7 @@ def _download_hubytconvert(video_id: str, save_dir: str) -> Optional[str]:
                 if not dl_url:
                     _log.error("hubytconvert: completed but no downloadUrl")
                     return None
-                fname = f"{video_id}.mp4"
-                return download_file(dl_url, save_dir, fname, timeout=180)
+                return utils_download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
             elif status_data.get("status") == "error":
                 _log.error(f"hubytconvert error: {status_data.get('message', 'unknown')}")
                 return None
@@ -309,177 +471,12 @@ def _download_hubytconvert(video_id: str, save_dir: str) -> Optional[str]:
         except Exception as e:
             _log.error(f"hubytconvert polling error: {e}")
             return None
-    _log.error("hubytconvert timeout (90 تلاش)")
+    _log.error("hubytconvert timeout")
     return None
 
 
-def _download_y2mate(video_id: str, save_dir: str) -> Optional[str]:
-    """y2mate downloader (نیازمند cf_clearance) – اصلاح‌شده: ارسال format به save"""
-    cf_clearance = getattr(settings, "Y2MATE_CF_CLEARANCE", None)
-    if not cf_clearance:
-        _log.warning("Y2MATE_CF_CLEARANCE تنظیم نشده. متد y2mate رد می‌شود.")
-        return None
-    try:
-        from y2mate_api import Handler
-    except ImportError:
-        _log.warning("y2mate_api library نصب نیست.")
-        return None
-
-    try:
-        # ساخت session با کوکی ضد کلاودفلر
-        sess = requests.Session()
-        sess.cookies.set("cf_clearance", cf_clearance, domain="y2mate.com")
-        sess.headers.update({"User-Agent": settings.USER_AGENT})
-
-        handler = Handler(f"https://youtube.com/watch?v={video_id}", session=sess)
-
-        # انتخاب بهترین فرمت mp4
-        best_format = None
-        best_quality = -1
-        for meta in handler.run():
-            if meta.get("type") == "video" and meta.get("f", "").startswith("mp4"):
-                quality_str = meta.get("quality", "0p")
-                try:
-                    quality_num = int(quality_str.rstrip("p"))
-                except ValueError:
-                    quality_num = 0
-                if quality_num > best_quality:
-                    best_quality = quality_num
-                    best_format = meta
-
-        if best_format is None:
-            _log.error("y2mate: هیچ فرمت ویدیویی mp4 یافت نشد.")
-            return None
-
-        _log.info(f"y2mate: انتخاب کیفیت {best_format.get('quality')} - شروع دانلود با format=...")
-
-        # 🔧 اصلاح اصلی: پاس دادن best_format به متد save
-        file_path = handler.save(save_dir, format=best_format)
-        if file_path and os.path.isfile(file_path):
-            return file_path
-
-        # fallback: جستجوی فایل با الگوی video_id
-        downloaded = _find_downloaded_file(video_id, save_dir)
-        if downloaded:
-            return downloaded
-
-        # در نهایت، آخرین فایل mp4 ایجاد شده در پوشه
-        try:
-            mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
-            if mp4_files:
-                mp4_files.sort(key=lambda f: os.path.getmtime(os.path.join(save_dir, f)), reverse=True)
-                return os.path.join(save_dir, mp4_files[0])
-        except Exception:
-            pass
-
-        _log.error("y2mate: فایل دانلود شده یافت نشد.")
-        return None
-
-    except Exception as e:
-        _log.error(f"y2mate download failed: {e}")
-        return None
-
-
-def _download_simatwa(video_id: str, save_dir: str) -> Optional[str]:
-    """Simatwa downloader (نیازمند نمونه در حال اجرا)"""
-    base = getattr(settings, "SIMATWA_API_BASE", None)
-    if not base:
-        _log.warning("SIMATWA_API_BASE تنظیم نشده.")
-        return None
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        dl_url = f"{base}/api/download?url={url}&type=video&quality=720p"
-        return download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
-    except Exception as e:
-        _log.error(f"simatwa download failed: {e}")
-        return None
-
-
-def _download_dark0013(video_id: str, save_dir: str) -> Optional[str]:
-    """dark0013 DownloaderAPI (نیازمند نمونه در حال اجرا)"""
-    base = getattr(settings, "DARK0013_API_BASE", None)
-    if not base:
-        _log.warning("DARK0013_API_BASE تنظیم نشده.")
-        return None
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        dl_url = f"{base}/download?url={url}&type=video"
-        return download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
-    except Exception as e:
-        _log.error(f"dark0013 download failed: {e}")
-        return None
-
-
-def _download_pointedsec(video_id: str, save_dir: str) -> Optional[str]:
-    """pointedsec yt-converter-api (نیازمند نمونه + توکن)"""
-    base = getattr(settings, "POINTEDSEC_API_BASE", None)
-    token = getattr(settings, "POINTEDSEC_API_TOKEN", None)
-    if not base or not token:
-        _log.warning("POINTEDSEC_API_BASE یا POINTEDSEC_API_TOKEN تنظیم نشده.")
-        return None
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        # مرحله تبدیل
-        r = requests.post(
-            f"{base}/convert",
-            json={"url": url, "format": "mp4", "quality": "720p"},
-            headers=headers,
-            timeout=settings.REQUEST_TIMEOUT
-        )
-        r.raise_for_status()
-        job = r.json()
-        file_id = job.get("fileId") or job.get("id")
-        if not file_id:
-            _log.error("pointedsec: fileId دریافت نشد.")
-            return None
-
-        # دانلود
-        dl_resp = requests.get(
-            f"{base}/download/{file_id}",
-            headers=headers,
-            stream=True,
-            timeout=180
-        )
-        dl_resp.raise_for_status()
-        dest = os.path.join(save_dir, f"{video_id}.mp4")
-        with open(dest, 'wb') as f:
-            for chunk in dl_resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return dest
-    except Exception as e:
-        _log.error(f"pointedsec download failed: {e}")
-        return None
-
-
-def _download_tmwgsicp(video_id: str, save_dir: str) -> Optional[str]:
-    """tmwgsicp video-download-api (نیازمند نمونه)"""
-    base = getattr(settings, "TMWGSICP_API_BASE", None)
-    if not base:
-        _log.warning("TMWGSICP_API_BASE تنظیم نشده.")
-        return None
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        r = requests.post(
-            f"{base}/api/download",
-            json={"url": url, "type": "video"},
-            timeout=settings.REQUEST_TIMEOUT
-        )
-        r.raise_for_status()
-        data = r.json()
-        dl_url = data.get("downloadUrl") or data.get("url")
-        if not dl_url:
-            _log.error("tmwgsicp: downloadUrl دریافت نشد.")
-            return None
-        return download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
-    except Exception as e:
-        _log.error(f"tmwgsicp download failed: {e}")
-        return None
-
-
-def _download_cobalt(video_id: str, save_dir: str) -> Optional[str]:
-    """cobalt.tools API (عمومی، ممکن است محدود شود)"""
-    url = f"https://www.youtube.com/watch?v={video_id}"
+def _download_cobalt(video_id: str, save_dir: str, quality: str = "1080p") -> Optional[str]:
+    """دانلود از cobalt.tools."""
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -488,7 +485,11 @@ def _download_cobalt(video_id: str, save_dir: str) -> Optional[str]:
     try:
         r = requests.post(
             "https://api.cobalt.tools/api/json",
-            json={"url": url, "videoQuality": "1080", "filenameStyle": "basic"},
+            json={
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "videoQuality": quality.replace("p", ""),
+                "filenameStyle": "basic"
+            },
             headers=headers,
             timeout=settings.REQUEST_TIMEOUT
         )
@@ -498,16 +499,16 @@ def _download_cobalt(video_id: str, save_dir: str) -> Optional[str]:
         if status in ("tunnel", "redirect"):
             dl_url = data.get("url")
             if not dl_url:
-                _log.error("cobalt: no URL in response")
+                _log.error("cobalt: no download URL")
                 return None
-            return download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
+            return utils_download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
         elif status == "picker":
             picker = data.get("picker", [])
             for opt in picker:
                 if opt.get("type") == "video":
                     dl_url = opt.get("url")
                     if dl_url:
-                        return download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
+                        return utils_download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
             _log.error("cobalt picker but no video option")
             return None
         else:
@@ -518,118 +519,44 @@ def _download_cobalt(video_id: str, save_dir: str) -> Optional[str]:
         return None
 
 
-# ═══════════════════════════════════════════════════════════
-# متدهای اطلاعات ویدئو (Info)
-# ═══════════════════════════════════════════════════════════
-def _info_simatwa_search(video_id: str) -> Optional[Dict]:
-    """تلاش برای دریافت اطلاعات از Simatwa search (query = video_id)"""
-    try:
-        results = _search_simatwa_search(video_id, 1)
-        if results and results[0].get("video_id") == video_id:
-            item = results[0]
-            return {
-                "video_id": item["video_id"],
-                "title": item["title"],
-                "duration": item["duration"],
-                "view_count": None,
-                "thumbnail_url": item["thumbnail_url"],
-                "uploader": item["uploader"],
-                "description": None
-            }
-    except Exception as e:
-        _log.error(f"_info_simatwa_search failed: {e}")
-    return None
+def _download_allmedia(video_id: str, save_dir: str, quality: str = "720p") -> Optional[str]:
+    """دانلود از AllMedia Downloader API."""
+    # تلاش با دو روش مختلف
+    methods_to_try = [
+        # روش GET
+        lambda: requests.get(
+            f"https://api.allmedia.app/dl?url=https://www.youtube.com/watch?v={video_id}",
+            headers={"User-Agent": settings.USER_AGENT},
+            timeout=30
+        ),
+        # روش POST
+        lambda: requests.post(
+            "https://api.allmedia.app/api/json",
+            json={"url": f"https://www.youtube.com/watch?v={video_id}", "quality": quality},
+            headers={"User-Agent": settings.USER_AGENT, "Content-Type": "application/json"},
+            timeout=30
+        ),
+    ]
+    dl_url = None
+    for try_func in methods_to_try:
+        try:
+            resp = try_func()
+            resp.raise_for_status()
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            # استخراج لینک دانلود
+            for key in ("download_url", "url", "link"):
+                if key in data:
+                    dl_url = data[key]
+                    break
+            if dl_url:
+                break
+        except Exception:
+            continue
 
-
-def _info_samzong(video_id: str) -> Optional[Dict]:
-    """تلاش برای دریافت اطلاعات از samzong (search)"""
-    try:
-        results = _search_samzong(video_id, 1)
-        if results and results[0].get("video_id") == video_id:
-            item = results[0]
-            return {
-                "video_id": item["video_id"],
-                "title": item["title"],
-                "duration": item["duration"],
-                "view_count": None,
-                "thumbnail_url": item["thumbnail_url"],
-                "uploader": item["uploader"],
-                "description": None
-            }
-    except Exception as e:
-        _log.error(f"_info_samzong failed: {e}")
-    return None
-
-
-def _info_piped(video_id: str) -> Optional[Dict]:
-    """اطلاعات کامل از Piped streams (با view_count به جای views)"""
-    try:
-        resp = requests.get(
-            f"https://pipedapi.kavin.rocks/streams/{video_id}",
-            timeout=settings.REQUEST_TIMEOUT
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return {
-            "video_id": video_id,
-            "title": data.get("title", ""),
-            "duration": data.get("duration", 0),
-            "view_count": data.get("views", 0),   # اصلاح: کلید داخلی views به view_count مپ شد
-            "thumbnail_url": data.get("thumbnailUrl", ""),
-            "uploader": data.get("uploader", ""),
-            "description": data.get("description", "")
-        }
-    except Exception as e:
-        _log.error(f"piped info failed: {e}")
+    if not dl_url:
+        _log.error("allmedia: no download URL found")
         return None
-
-
-def _info_innertube2(video_id: str) -> Optional[Dict]:
-    """اطلاعات از InnerTube"""
-    try:
-        from innertube import InnerTube
-    except ImportError:
-        return None
-    try:
-        client = InnerTube("WEB")
-        # ممکن است اسم متد فرق کند
-        video_info = client.get_video(video_id) if hasattr(client, 'get_video') else client.video(video_id)
-        if not video_info:
-            return None
-        details = video_info.get("videoDetails", {})
-        return {
-            "video_id": details.get("videoId", video_id),
-            "title": details.get("title", ""),
-            "duration": int(details.get("lengthSeconds", 0)),
-            "view_count": int(details.get("viewCount", 0)),
-            "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg",
-            "uploader": details.get("author", ""),
-            "description": details.get("shortDescription", "")
-        }
-    except Exception as e:
-        _log.error(f"innertube2 info failed: {e}")
-        return None
-
-
-def _info_oembed(video_id: str) -> Optional[Dict]:
-    """اطلاعات پایه از oEmbed"""
-    url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-    try:
-        resp = requests.get(url, timeout=settings.REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        return {
-            "video_id": video_id,
-            "title": data.get("title", ""),
-            "duration": None,
-            "view_count": None,
-            "thumbnail_url": data.get("thumbnail_url", f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg"),
-            "uploader": data.get("author_name", ""),
-            "description": None
-        }
-    except Exception as e:
-        _log.error(f"oembed info failed: {e}")
-        return None
+    return utils_download_file(dl_url, save_dir, f"{video_id}.mp4", timeout=180)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -638,31 +565,51 @@ def _info_oembed(video_id: str) -> Optional[Dict]:
 def search_youtube(
     query: str,
     limit: int = 10,
-    chain: Optional[List[str]] = None,
-    start_method: Optional[str] = None
+    mode: str = "browser",
+    enrich: bool = True
 ) -> Tuple[List[Dict], Optional[str]]:
     """
-    جستجوی یوتیوب با fallback. برمی‌گرداند (لیست نتایج, نام متد موفق).
+    جستجوی یوتیوب. حالت‌ها:
+    - browser: استفاده از Playwright (پیش‌فرض)
+    - api: استفاده از scrapetube + oembed
     """
-    if chain is None:
+    if mode == "browser":
+        results = _search_browser(query, limit)
+        if results:
+            return results, "browser"
+        else:
+            # fallback به api در صورت شکست
+            _log.warning("Browser search failed, falling back to API.")
+            return search_youtube(query, limit, mode="api", enrich=enrich)
+    elif mode == "api":
+        # زنجیره فقط scrapetube
         chain = settings.DEFAULT_SEARCH_CHAIN
-
-    search_map = {
-        "simatwa_search": _search_simatwa_search,
-        "samzong": _search_samzong,
-        "piped": _search_piped,
-        "innertube2": _search_innertube2,
-        "scrapetube": _search_scrapetube
-    }
-
-    def op(method: str, kw: dict) -> Optional[List[Dict]]:
-        func = search_map.get(method)
-        if not func:
-            return None
-        return func(query=kw["query"], limit=kw["limit"])
-
-    return run_with_fallback(chain, op, start_method, query=query, limit=limit)
-
+        search_map = {
+            "scrapetube": _search_scrapetube
+        }
+        def op(method: str, kw: dict) -> Optional[List[Dict]]:
+            func = search_map.get(method)
+            if not func:
+                return None
+            return func(query=kw["query"], limit=kw["limit"])
+        results, method_name = run_with_fallback(chain, op, query=query, limit=limit)
+        if results and enrich:
+            # غنی‌سازی هر نتیجه با oembed برای دریافت عنوان
+            for r in results:
+                if not r["title"]:
+                    try:
+                        oembed_data = _enrich_oembed(r["video_id"])
+                        if oembed_data:
+                            r["title"] = oembed_data.get("title", r["title"])
+                            r["uploader"] = oembed_data.get("uploader", r["uploader"])
+                            if oembed_data.get("thumbnail_url"):
+                                r["thumbnail_url"] = oembed_data["thumbnail_url"]
+                    except Exception:
+                        pass
+        return results, method_name
+    else:
+        _log.error(f"search mode ناشناخته: {mode}")
+        return [], None
 
 def get_video_info(
     video_id: str,
@@ -670,80 +617,39 @@ def get_video_info(
     start_method: Optional[str] = None
 ) -> Tuple[Dict, Optional[str]]:
     """
-    دریافت اطلاعات ویدئو (دیکشنری) با fallback.
+    دریافت اطلاعات کامل ویدئو با غنی‌سازی.
+    در صورت شکست، فقط oembed را امتحان می‌کند.
     """
-    if chain is None:
-        chain = settings.DEFAULT_INFO_CHAIN
-
-    info_map = {
-        "simatwa_search": _info_simatwa_search,
-        "samzong": _info_samzong,
-        "piped": _info_piped,
-        "innertube2": _info_innertube2,
-        "oembed": _info_oembed
-    }
-
-    def op(method: str, kw: dict) -> Optional[Dict]:
-        func = info_map.get(method)
-        if not func:
-            return None
-        return func(video_id=kw["video_id"])
-
-    result, method = run_with_fallback(chain, op, start_method, video_id=video_id)
-    if result is None:
-        return {}, method
-    return result, method
-
+    # تلاش برای غنی‌سازی کامل
+    info = enrich_video_info(video_id)
+    if info.get("title"):
+        return info, "enrichment"
+    # fallback به oembed خالی
+    oembed_data = _enrich_oembed(video_id)
+    if oembed_data:
+        oembed_data["video_id"] = video_id
+        return oembed_data, "oembed"
+    return {}, None
 
 def download_video(
     video_id: str,
     save_dir: str,
     chain: Optional[List[str]] = None,
-    start_method: Optional[str] = None
+    start_method: Optional[str] = None,
+    quality: str = "720p"
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    دانلود ویدئو با fallback. برمی‌گرداند (مسیر فایل, نام متد).
-    """
+    """دانلود ویدئو با fallback روی متدهای دانلود."""
     os.makedirs(save_dir, exist_ok=True)
     if chain is None:
-        chain = settings.DEFAULT_DOWNLOAD_CHAIN.copy()
-    if "hubytconvert" not in chain:
-        chain.insert(0, "hubytconvert")
-
+        chain = settings.DEFAULT_DOWNLOAD_CHAIN
     download_map = {
-        "hubytconvert": _download_hubytconvert,
-        "y2mate": _download_y2mate,
-        "simatwa": _download_simatwa,
-        "dark0013": _download_dark0013,
-        "pointedsec": _download_pointedsec,
-        "tmwgsicp": _download_tmwgsicp,
-        "cobalt": _download_cobalt
+        "hubytconvert": lambda vid, dir: _download_hubytconvert(vid, dir, quality),
+        "cobalt": lambda vid, dir: _download_cobalt(vid, dir, quality),
+        "allmedia": lambda vid, dir: _download_allmedia(vid, dir, quality),
     }
-
     def op(method: str, kw: dict) -> Optional[str]:
         func = download_map.get(method)
         if not func:
             return None
         return func(video_id=kw["video_id"], save_dir=kw["save_dir"])
-
     return run_with_fallback(chain, op, start_method, video_id=video_id, save_dir=save_dir)
-
-
-def download_thumbnail(video_id: str, save_dir: str) -> Tuple[Optional[str], str]:
-    """
-    دانلود تصویر بندانگشتی با کیفیت‌های مختلف. برمی‌گرداند (مسیر, "direct").
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    qualities = ["maxresdefault.jpg", "sddefault.jpg", "hqdefault.jpg", "mqdefault.jpg"]
-    for quality in qualities:
-        thumb_url = f"https://img.youtube.com/vi/{video_id}/{quality}"
-        try:
-            head = requests.head(thumb_url, timeout=5)
-            if head.status_code == 200:
-                fname = f"{video_id}_thumb.jpg"
-                path = download_file(thumb_url, save_dir, fname, timeout=30)
-                if path:
-                    return path, "direct"
-        except Exception:
-            continue
-    return None, "direct"
