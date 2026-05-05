@@ -1,7 +1,8 @@
 """
 utils.py - توابع کمکی و ابزارهای عمومی ربات یوتیوب Bale Ultimate
-شامل لاگینگ ضد کرش، تقسیم فایل، تقسیم ویدئو با FFmpeg،
+شامل لاگینگ ضد کرش، تقسیم فایل، تقسیم ویدئو با FFmpeg (زمانی و حجمی)،
 مدیریت آپلود هوشمند با ذخیره وضعیت، دانلود فایل و غیره.
+نسخه بازنگری‌شده: افزوده‌شدن split_video_by_size
 """
 
 import logging
@@ -11,6 +12,7 @@ import time
 import subprocess
 import re
 import shutil
+import math                               # برای محاسبات تقسیم حجمی
 from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict, Any, Callable
 
@@ -106,11 +108,11 @@ def split_file_binary(file_path: str, prefix: str, ext: str) -> List[str]:
     return chunks
 
 # ═══════════════════════════════════════════════════════════
-# تقسیم ویدئو به بخش‌های قابل پخش با FFmpeg
+# تقسیم ویدئو به بخش‌های قابل پخش با FFmpeg (زمانی)
 # ═══════════════════════════════════════════════════════════
 def split_video_playable(video_path: str, output_dir: str, segment_duration: int = 60) -> List[str]:
     """
-    با استفاده از FFmpeg ویدئو را به قطعات MP4 قابل پخش تقسیم می‌کند.
+    با استفاده از FFmpeg ویدئو را به قطعات MP4 قابل پخش تقسیم می‌کند (بر اساس زمان).
     هر بخش یک فایل ویدئویی مستقل است.
     """
     logger = get_logger('utils.split_video_playable')
@@ -135,7 +137,7 @@ def split_video_playable(video_path: str, output_dir: str, segment_duration: int
         output_pattern
     ]
 
-    logger.info(f"در حال تقسیم ویدئو: {' '.join(cmd)}")
+    logger.info(f"در حال تقسیم ویدئو (زمانی): {' '.join(cmd)}")
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
@@ -151,6 +153,94 @@ def split_video_playable(video_path: str, output_dir: str, segment_duration: int
         logger.warning("FFmpeg هیچ قطعه‌ای تولید نکرد.")
     else:
         logger.info(f"{len(chunk_files)} قطعه ویدئو در {output_dir} ایجاد شد.")
+    return chunk_files
+
+# ═══════════════════════════════════════════════════════════
+# تقسیم ویدئو به قطعات قابل پخش با محدودیت حجم (split_video_by_size)
+# ═══════════════════════════════════════════════════════════
+def split_video_by_size(
+    video_path: str,
+    output_dir: str,
+    max_size_bytes: int = 19 * 1024 * 1024
+) -> List[str]:
+    """
+    تقسیم یک فایل ویدئو به قطعات قابل پخش MP4 که حجم هرکدام حداکثر max_size_bytes باشد.
+    از روش تقسیم زمانی تقریبی (با فرض توزیع یکنواخت بیت‌ریت) استفاده می‌کند.
+
+    Args:
+        video_path: مسیر فایل ویدئوی اصلی.
+        output_dir: دایرکتوری خروجی برای قطعات.
+        max_size_bytes: حداکثر حجم مجاز برای هر قطعه (پیش‌فرض 19 مگابایت).
+
+    Returns:
+        لیست مرتب‌شده از مسیرهای کامل قطعات تولیدشده. در صورت خطا یا عدم موفقیت، لیست خالی.
+    """
+    logger = get_logger('utils.split_video_by_size')
+    if not os.path.exists(video_path):
+        logger.error(f"فایل ویدئو یافت نشد: {video_path}")
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    total_size = os.path.getsize(video_path)
+    if total_size <= max_size_bytes:
+        # فایل کوچک‌تر از حد مجاز - فقط کپی کن
+        dest = os.path.join(output_dir, os.path.basename(video_path))
+        shutil.copy2(video_path, dest)
+        logger.info(f"ویدئو بدون تقسیم (حجم {total_size} ≤ {max_size_bytes}) کپی شد: {dest}")
+        return [dest]
+
+    # دریافت مدت زمان ویدئو با ffprobe
+    ffprobe_cmd = [
+        settings.FFMPEG_PATH.replace("ffmpeg", "ffprobe") if "ffmpeg" in settings.FFMPEG_PATH else "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0",
+        video_path
+    ]
+    try:
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+        total_duration = float(result.stdout.strip())
+        if total_duration <= 0:
+            raise ValueError("مدت زمان نامعتبر")
+    except Exception as e:
+        logger.error(f"دریافت مدت زمان ویدئو با ffprobe ناموفق بود: {e}")
+        return []
+
+    # محاسبه تعداد قطعات و مدت زمان تقریبی هر کدام
+    num_chunks = math.ceil(total_size / max_size_bytes)
+    chunk_duration = total_duration / num_chunks
+    logger.info(f"تقسیم ویدئو به {num_chunks} قطعه با مدت زمان ~{chunk_duration:.2f}s هرکدام")
+
+    # اجرای FFmpeg با segment_time
+    output_pattern = os.path.join(output_dir, "chunk_%03d.mp4")
+    cmd = [
+        settings.FFMPEG_PATH,
+        "-y",
+        "-i", video_path,
+        "-c", "copy",
+        "-map", "0",
+        "-f", "segment",
+        "-segment_time", str(chunk_duration),
+        "-reset_timestamps", "1",
+        output_pattern
+    ]
+    logger.info(f"FFmpeg split by size: {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg split by size با خطا مواجه شد: {e.stderr}")
+        return []
+
+    # جمع‌آوری قطعات تولیدی
+    chunk_files = []
+    for fname in sorted(os.listdir(output_dir)):
+        if re.match(r'^chunk_\d{3}\.mp4$', fname):
+            chunk_files.append(os.path.join(output_dir, fname))
+    if not chunk_files:
+        logger.warning("split_video_by_size: هیچ قطعه‌ای تولید نشد.")
+    else:
+        logger.info(f"{len(chunk_files)} قطعه ویدئو با محدودیت حجم ایجاد شد.")
     return chunk_files
 
 # ═══════════════════════════════════════════════════════════
