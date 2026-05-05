@@ -1,6 +1,6 @@
 """
-main.py - بدنهٔ اصلی ربات یوتیوب Bale Ultimate (نسخه اصلاح‌شده)
-تمامی باگ‌های گزارش‌شده (send_document، next_info، جستجوی ۳ برابری، پایداری صف) برطرف شده‌اند.
+main.py - بدنهٔ اصلی ربات یوتیوب Bale (نسخه ۳)
+مدیریت پیام‌ها، callbackها، صف jobها، دستورات کوتاه متنی و تنظیمات شیشه‌ای.
 """
 
 import os
@@ -8,10 +8,12 @@ import sys
 import json
 import time
 import uuid
-import shutil
+import re
+import hashlib
 import threading
 import queue
-from typing import Optional, Dict, List, Any
+import shutil
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -22,7 +24,7 @@ from utils import (
     save_json,
     extract_video_id,
     split_file_binary,
-    split_video_playable,
+    split_video_by_size,
     upload_manager,
     safe_remove,
     download_file,
@@ -37,21 +39,42 @@ _log = get_logger("main")
 BOT_TOKEN = settings.BOT_TOKEN
 API_BASE = settings.API_BASE
 DATA_DIR = settings.DATA_DIR
+DOWNLOADS_DIR = settings.DOWNLOADS_DIR
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # صف jobها (thread‑safe)
-job_queue: queue.Queue = queue.Queue()
+task_queue: queue.Queue = queue.Queue()
+queue_lock = threading.Lock()
 
 # وضعیت کاربر
 user_state: Dict[int, str] = {}
+user_state_lock = threading.Lock()
 
-# آخرین نتایج جستجو
-last_search: Dict[str, Any] = {}
-last_search_lock = threading.Lock()
-
-# تنظیمات متدها و UI (در حافظه، همگام با فایل)
+# تنظیمات متدها و UI
 method_config: Dict[str, Any] = {}
 method_config_lock = threading.Lock()
+
+# نگاشت کدهای کوتاه به video_id
+cmd_map: Dict[str, str] = {}
+cmd_map_lock = threading.Lock()
+
+# مسیر فایل cmd_map
+CMD_MAP_FILE = os.path.join(DATA_DIR, "cmd_map.json")
+
+# -------------------------------------------------------------------
+# احراز هویت ادمین
+# -------------------------------------------------------------------
+def get_admin_chat_id() -> int:
+    """خواندن chat_id ادمین از فایل یا پیش‌فرض."""
+    if os.path.exists(settings.ADMIN_FILE):
+        data = load_json(settings.ADMIN_FILE)
+        return data.get("chat_id", settings.DEFAULT_ADMIN_CHAT_ID)
+    return settings.DEFAULT_ADMIN_CHAT_ID
+
+def is_admin(chat_id: int) -> bool:
+    """بررسی اینکه chat_id متعلق به ادمین است."""
+    return chat_id == get_admin_chat_id()
 
 # -------------------------------------------------------------------
 # ابزارهای API بله
@@ -61,7 +84,6 @@ def _api(method: str, data: Optional[dict] = None, files: Optional[dict] = None)
     url = f"{API_BASE}/{method}"
     try:
         if files:
-            # درخواست multipart/form-data
             resp = requests.post(url, data=data, files=files, timeout=30)
         else:
             resp = requests.post(url, json=data, timeout=settings.REQUEST_TIMEOUT)
@@ -73,7 +95,7 @@ def _api(method: str, data: Optional[dict] = None, files: Optional[dict] = None)
 
 
 def send_message(chat_id: int, text: str, reply_markup: Optional[str] = None) -> Optional[dict]:
-    """ارسال پیام متنی."""
+    """ارسال پیام متنی (با inline keyboard اختیاری)."""
     data = {"chat_id": chat_id, "text": text}
     if reply_markup:
         data["reply_markup"] = reply_markup
@@ -83,14 +105,13 @@ def send_message(chat_id: int, text: str, reply_markup: Optional[str] = None) ->
 def send_document(chat_id: int, file_path: str, caption: str = "") -> bool:
     """
     ارسال فایل (سند) به کاربر.
-    اصلاح: نام فایل به‌صورت tuple به requests ارسال می‌شود.
+    بازگشت True در صورت موفقیت.
     """
     if not os.path.exists(file_path):
         _log.error(f"send_document: file not found {file_path}")
         return False
     try:
         with open(file_path, "rb") as f:
-            # 🔧 اصلاح: ارائه نام فایل برای multipart
             files = {"document": (os.path.basename(file_path), f)}
             data = {"chat_id": chat_id, "caption": caption}
             result = _api("sendDocument", data=data, files=files)
@@ -101,11 +122,11 @@ def send_document(chat_id: int, file_path: str, caption: str = "") -> bool:
 
 
 def get_updates(offset: int = 0, timeout: int = 50) -> List[dict]:
-    """long‑polling برای دریافت به‌روزرسانی‌ها."""
-    data = {"offset": offset, "timeout": timeout}
+    """دریافت به‌روزرسانی‌ها با long‑polling."""
+    data_payload = {"offset": offset, "timeout": timeout}
     url = f"{API_BASE}/getUpdates"
     try:
-        resp = requests.post(url, json=data, timeout=timeout + 10)
+        resp = requests.post(url, json=data_payload, timeout=timeout + 10)
         resp.raise_for_status()
         result = resp.json()
         return result.get("result", [])
@@ -115,34 +136,61 @@ def get_updates(offset: int = 0, timeout: int = 50) -> List[dict]:
         return []
 
 
-def edit_reply_markup(chat_id: int, message_id: int, reply_markup: str) -> Optional[dict]:
-    """ویرایش کیبورد inline یک پیام."""
-    data = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "reply_markup": reply_markup
-    }
-    return _api("editMessageReplyMarkup", data)
-
-
 def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: Optional[str] = None) -> Optional[dict]:
-    """ویرایش متن و کیبورد پیام."""
+    """ویرایش متن و کیبورد یک پیام."""
     data = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup:
         data["reply_markup"] = reply_markup
     return _api("editMessageText", data)
 
 
+def edit_reply_markup(chat_id: int, message_id: int, reply_markup: str) -> Optional[dict]:
+    """ویرایش کیبورد inline یک پیام."""
+    data = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup}
+    return _api("editMessageReplyMarkup", data)
+
+
 def answer_callback_query(callback_query_id: str, text: str = "") -> Optional[dict]:
-    """پاسخ به callback query."""
+    """پاسخ به یک callback query."""
     data = {"callback_query_id": callback_query_id, "text": text}
     return _api("answerCallbackQuery", data)
 
 
 # -------------------------------------------------------------------
-# مدیریت تنظیمات
+# مدیریت cmd_map (کدهای کوتاه)
 # -------------------------------------------------------------------
-def load_method_config() -> dict:
+def load_cmd_map() -> Dict[str, str]:
+    """بارگذاری نگاشت کدهای کوتاه از فایل."""
+    return load_json(CMD_MAP_FILE, {})
+
+def save_cmd_map(cmap: Dict[str, str]) -> None:
+    """ذخیرهٔ نگاشت کدهای کوتاه در فایل."""
+    save_json(CMD_MAP_FILE, cmap)
+
+def generate_short_code(video_id: str) -> str:
+    """تولید کد کوتاه ۴ نویسه‌ای (هگز) بر اساس MD5 video_id."""
+    global cmd_map
+    full_hash = hashlib.md5(video_id.encode()).hexdigest()
+    with cmd_map_lock:
+        for i in range(4, len(full_hash) + 1):
+            code = full_hash[:i]
+            if code not in cmd_map or cmd_map[code] == video_id:
+                return code
+    return full_hash  # fallback (نباید به اینجا برسد)
+
+def register_video_command(video_id: str) -> str:
+    """ثبت video_id و برگرداندن کد کوتاه."""
+    global cmd_map
+    with cmd_map_lock:
+        code = generate_short_code(video_id)
+        cmd_map[code] = video_id
+        save_cmd_map(cmd_map)
+    return code
+
+# -------------------------------------------------------------------
+# مدیریت تنظیمات متدها و UI
+# -------------------------------------------------------------------
+def load_method_config() -> Dict[str, Any]:
     """بارگذاری تنظیمات از فایل، یا ایجاد پیش‌فرض."""
     default = settings.DEFAULT_SESSION_SETTINGS.copy()
     config = load_json(settings.METHOD_CONFIG_FILE, default)
@@ -151,15 +199,13 @@ def load_method_config() -> dict:
             config[key] = val
     return config
 
-
 def save_method_config(config: dict) -> None:
     save_json(settings.METHOD_CONFIG_FILE, config)
-
 
 def get_enabled_chain(category: str) -> List[str]:
     """ساخت زنجیرهٔ فعال بر اساس متدهای enabled و ترتیب پیش‌فرض."""
     with method_config_lock:
-        config = method_config
+        config = method_config.copy()
     if category == "search":
         default = settings.DEFAULT_SEARCH_CHAIN
         enabled = config.get("enabled_search_methods", list(settings.SEARCH_METHODS.keys()))
@@ -168,25 +214,16 @@ def get_enabled_chain(category: str) -> List[str]:
         enabled = config.get("enabled_download_methods", list(settings.DOWNLOAD_METHODS.keys()))
     return [m for m in default if m in enabled]
 
-
-# -------------------------------------------------------------------
-# آخرین جستجو
-# -------------------------------------------------------------------
-def load_last_search() -> Dict[str, Any]:
-    return load_json("data/last_search.json", {})
-
-def save_last_search(data: Dict[str, Any]) -> None:
-    save_json("data/last_search.json", data)
-
-
 # -------------------------------------------------------------------
 # ساخت کیبوردهای inline
 # -------------------------------------------------------------------
 def _inline_keyboard(buttons: List[List[dict]]) -> str:
+    """تبدیل لیست دکمه‌ها به JSON مورد نیاز Bale."""
     return json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
 
 
 def build_main_menu() -> str:
+    """منوی اصلی."""
     return _inline_keyboard([
         [{"text": "🔍 جستجوی یوتیوب", "callback_data": "search"}],
         [{"text": "📥 دانلود با لینک", "callback_data": "download_link"}],
@@ -196,58 +233,21 @@ def build_main_menu() -> str:
     ])
 
 
-def build_search_keyboard(results: List[dict], page: int, total_pages: int, method_used: str) -> str:
-    buttons = []
-    start = page * settings.UI_SETTINGS["result_page_size"]
-    end = start + settings.UI_SETTINGS["result_page_size"]
-    page_results = results[start:end]
-    for vid in page_results:
-        vid_id = vid.get("video_id", "")
-        title = vid.get("title") or vid_id
-        short_title = title[:30] + "..." if len(title) > 30 else title
-        buttons.append([
-            {"text": f"📋 {short_title}", "callback_data": f"info|{vid_id}|{method_used}"},
-            {"text": "🖼", "callback_data": f"thumb|{vid_id}|{method_used}"},
-            {"text": "📥", "callback_data": f"dl|{vid_id}|{method_used}"},
-        ])
-
-    nav = []
-    if page > 0:
-        nav.append({"text": "◀️", "callback_data": f"page|{page-1}"})
-    if page < total_pages - 1:
-        nav.append({"text": "▶️", "callback_data": f"page|{page+1}"})
-    if nav:
-        buttons.append(nav)
-    control = [
-        {"text": "🔁 متد بعدی", "callback_data": f"next_search|{method_used}"},
-        {"text": "📥 دانلود همه", "callback_data": "batch_dl"},
-    ]
-    buttons.append(control)
-    return _inline_keyboard(buttons)
-
-
-def build_info_keyboard(video_id: str, method_used: str) -> str:
-    """
-    🔧 اصلاح: دکمهٔ «متد بعدی» حالا video_id را همراه دارد.
-    """
-    return _inline_keyboard([
-        [{"text": "📥 دانلود", "callback_data": f"dl|{video_id}|{method_used}"}],
-        [{"text": "🖼 تامنیل", "callback_data": f"thumb|{video_id}|{method_used}"}],
-        [{"text": "🔁 متد بعدی", "callback_data": f"next_info|{video_id}|{method_used}"}],
-    ])
-
-
 def build_settings_menu() -> str:
+    """منوی تنظیمات شیشه‌ای."""
     return _inline_keyboard([
         [{"text": "🔗 زنجیرهٔ دانلود", "callback_data": "settings_chain|download"}],
         [{"text": "🔗 زنجیرهٔ جستجو", "callback_data": "settings_chain|search"}],
         [{"text": "📦 حالت آپلود", "callback_data": "settings_upload_mode"}],
-        [{"text": "🔢 تعداد نتایج در صفحه", "callback_data": "settings_page_size"}],
+        [{"text": "🎚️ کیفیت دانلود", "callback_data": "settings_quality"}],
+        [{"text": "🔍 حالت جستجو", "callback_data": "settings_search_mode"}],
+        [{"text": "🔢 نتایج در صفحه", "callback_data": "settings_page_size"}],
         [{"text": "🔙 بازگشت", "callback_data": "main_menu"}],
     ])
 
 
 def build_method_chain_keyboard(category: str) -> str:
+    """کیبورد مدیریت زنجیره (فعال/غیرفعال کردن متدها)."""
     with method_config_lock:
         config = method_config.copy()
     if category == "search":
@@ -266,39 +266,50 @@ def build_method_chain_keyboard(category: str) -> str:
     return _inline_keyboard(buttons)
 
 
+def build_quality_keyboard() -> str:
+    """کیبورد انتخاب کیفیت دانلود."""
+    with method_config_lock:
+        current = method_config.get("download_quality", "720p")
+    qualities = ["144p", "360p", "720p", "1080p"]
+    buttons = []
+    for q in qualities:
+        marker = "✅" if q == current else "⬜"
+        buttons.append([{"text": f"{marker} {q}", "callback_data": f"quality_set|{q}"}])
+    buttons.append([{"text": "🔙 بازگشت", "callback_data": "settings"}])
+    return _inline_keyboard(buttons)
+
+
 # -------------------------------------------------------------------
-# مدیریت jobها و persistence صف (🔧 اصلاح‌شده)
+# صف jobها و worker
 # -------------------------------------------------------------------
 def enqueue_job(job: dict) -> None:
     """اضافه کردن job به صف درون‌حافظه و ذخیره در فایل."""
     job["id"] = str(uuid.uuid4())
-    # ذخیره در فایل (ماندگاری)
     try:
         queue_data = load_json(settings.QUEUE_FILE, [])
         queue_data.append(job)
         save_json(settings.QUEUE_FILE, queue_data)
     except Exception as e:
         _log.error(f"Failed to persist job: {e}")
-    job_queue.put(job)
+    task_queue.put(job)
     _log.info(f"Job enqueued: {job['id']} / {job.get('command')}")
 
 
 def worker_loop() -> None:
     """پردازش jobها در thread جداگانه، با حذف ایمن از فایل پس از اتمام."""
     _log.info("Worker thread started.")
-
-    # بارگذاری jobهای قبلی از فایل (در صورت وجود) و انتقال به صف حافظه
+    # بارگذاری jobهای قبلی از فایل
     try:
         pending = load_json(settings.QUEUE_FILE, [])
         for j in pending:
-            job_queue.put(j)
+            task_queue.put(j)
         _log.info(f"Loaded {len(pending)} pending jobs from file.")
     except Exception as e:
         _log.error(f"Error loading queue file: {e}")
 
     while True:
         try:
-            job = job_queue.get(timeout=5)
+            job = task_queue.get(timeout=5)
         except queue.Empty:
             continue
 
@@ -309,141 +320,130 @@ def worker_loop() -> None:
         except Exception as e:
             _log.exception(f"Job {job['id']} failed: {e}")
         finally:
-            # 🔧 اصلاح: حذف job از فایل بعد از پردازش
+            # حذف job از فایل بعد از پردازش
             try:
                 jobs = load_json(settings.QUEUE_FILE, [])
                 jobs = [j for j in jobs if j.get("id") != job.get("id")]
                 save_json(settings.QUEUE_FILE, jobs)
             except Exception as e:
                 _log.error(f"Failed to remove job from file: {e}")
-            job_queue.task_done()
+            task_queue.task_done()
 
 
 # -------------------------------------------------------------------
 # اجرای jobها
 # -------------------------------------------------------------------
 def process_job(job: dict) -> None:
+    """پردازش یک job بر اساس command."""
     cmd = job.get("command")
     chat_id = job.get("chat_id")
 
     if cmd == "search":
         query = job["query"]
-        limit = job.get("limit", settings.UI_SETTINGS["result_page_size"])
-        chain = job.get("chain", get_enabled_chain("search"))
-        start_method = job.get("start_method")
+        mode = job.get("mode") or method_config.get("search_mode", "browser")
+        limit = method_config.get("result_page_size", 5)
 
-        # 🔧 اصلاح: جستجو با یک حد معقول (۳۰ نتیجه) به‌جای limit*3
         results, method_used = youtube_core.search_youtube(
-            query, limit=30, chain=chain, start_method=start_method
+            query, limit=limit, mode=mode, enrich=False
         )
         if not results:
             send_message(chat_id, "❌ هیچ نتیجه‌ای یافت نشد.")
             return
 
-        # ذخیرهٔ آخرین جستجو
-        with last_search_lock:
-            last_search.clear()
-            last_search["results"] = results
-            last_search["method_used"] = method_used
-            last_search["query"] = query
-            last_search["chain"] = chain
-            save_last_search(last_search)
+        # ساخت پیام نتایج با کدهای کوتاه
+        lines = [f"🔍 نتایج جستجو برای: {query} (روش: {method_used})\n"]
+        for i, vid in enumerate(results[:limit], 1):
+            vid_id = vid.get("video_id", "")
+            code = register_video_command(vid_id)
+            title = vid.get("title") or "بدون عنوان"
+            duration = vid.get("duration") or "?"
+            uploader = vid.get("uploader") or "?"
+            lines.append(f"{i}️⃣ {title}")
+            lines.append(f"   ⏱ {duration} | 👤 {uploader}")
+            lines.append(f"   📋 /H{code}")
+            lines.append(f"   📥 /Download_{code}")
+            lines.append("")
 
-        total_pages = (len(results) + limit - 1) // limit
-        page = 0
-
-        # ارسال تامنیل‌ها
-        for idx, vid in enumerate(results):
-            try:
-                thumb_path, _ = youtube_core.download_thumbnail(vid["video_id"], "downloads")
-                if thumb_path:
-                    caption = f"{vid.get('title')} - روش: {method_used}" if settings.UI_SETTINGS["show_method_in_output"] else vid.get("title")
-                    send_document(chat_id, thumb_path, caption=caption)
-                    safe_remove(thumb_path)
-            except Exception as e:
-                _log.error(f"Thumbnail send error for {vid.get('video_id')}: {e}")
-
-        header = f"🔍 نتایج جستجو برای: {query}\nروش: {method_used}\nصفحه ۱ از {total_pages}"
-        keyboard = build_search_keyboard(results, page, total_pages, method_used)
-        send_message(chat_id, header, reply_markup=keyboard)
+        text = "\n".join(lines)
+        send_message(chat_id, text)
 
     elif cmd == "info":
         video_id = job["video_id"]
-        chain = job.get("chain", settings.DEFAULT_INFO_CHAIN)
-        start_method = job.get("start_method")
-        info_dict, method_used = youtube_core.get_video_info(
-            video_id, chain=chain, start_method=start_method
-        )
-        if not info_dict:
-            send_message(chat_id, "❌ اطلاعات ویدئو دریافت نشد.")
+        info_dict, method_used = youtube_core.get_video_info(video_id)
+
+        if not info_dict or not info_dict.get("title"):
+            send_message(chat_id, "❌ اطلاعات ویدئو یافت نشد.")
             return
 
+        # دانلود و ارسال تامنیل
+        try:
+            thumb_path, _ = youtube_core.download_thumbnail(video_id, DOWNLOADS_DIR)
+            if thumb_path:
+                caption = f"{info_dict.get('title', '')} - {method_used}" if settings.UI_SETTINGS["show_method_in_output"] else info_dict.get("title", "")
+                send_document(chat_id, thumb_path, caption=caption)
+                safe_remove(thumb_path)
+        except Exception as e:
+            _log.error(f"Info thumbnail error: {e}")
+
+        # ساخت پیام اطلاعات
         title = info_dict.get("title", "بدون عنوان")
         duration = info_dict.get("duration", "?")
         views = info_dict.get("view_count", "?")
+        likes = info_dict.get("like_count", "?")
         uploader = info_dict.get("uploader", "?")
         desc = info_dict.get("description", "")
-        if desc and len(desc) > 200:
-            desc = desc[:200] + "..."
+        if desc and len(desc) > 300:
+            desc = desc[:300] + "..."
 
         msg = (
             f"🎬 {title}\n"
             f"⏱ مدت: {duration}\n"
             f"👁 بازدید: {views}\n"
+            f"❤️ لایک: {likes}\n"
             f"👤 آپلودکننده: {uploader}\n"
             f"📝 توضیحات: {desc if desc else '---'}\n"
-            f"روش: {method_used}"
+            f"🔮 روش: {method_used}"
         )
-
-        try:
-            thumb_path, _ = youtube_core.download_thumbnail(video_id, "downloads")
-            if thumb_path:
-                send_document(chat_id, thumb_path, caption="تصویر بند‌انگشتی")
-                safe_remove(thumb_path)
-        except Exception as e:
-            _log.error(f"Info thumbnail error: {e}")
-
-        keyboard = build_info_keyboard(video_id, method_used)
-        send_message(chat_id, msg, reply_markup=keyboard)
+        send_message(chat_id, msg)
 
     elif cmd == "download":
         video_id = job["video_id"]
-        save_dir = os.path.join("downloads", job["id"])
+        save_dir = os.path.join(DOWNLOADS_DIR, job["id"])
         os.makedirs(save_dir, exist_ok=True)
+        quality = job.get("quality", method_config.get("download_quality", "720p"))
         chain = job.get("chain", get_enabled_chain("download"))
-        start_method = job.get("start_method")
 
         file_path, method_used = youtube_core.download_video(
-            video_id, save_dir, chain=chain, start_method=start_method
+            video_id, save_dir, chain=chain, quality=quality
         )
         if not file_path or not os.path.exists(file_path):
             send_message(chat_id, "❌ دانلود ناموفق بود.")
             safe_remove(save_dir)
             return
 
+        # آپلود بر اساس حالت
         upload_mode = method_config.get("upload_mode", "playable_chunks")
-        chunk_dur = method_config.get("chunk_duration_seconds", 60)
-
         if upload_mode == "zip":
+            # ساخت zip و تقسیم
             zip_base = os.path.join(save_dir, f"video_{video_id}")
             shutil.make_archive(zip_base, 'zip', os.path.dirname(file_path), os.path.basename(file_path))
             zip_path = zip_base + ".zip"
             parts = split_file_binary(zip_path, f"video_{video_id}", ".zip")
-            safe_remove(zip_path)
+            safe_remove(zip_path)  # پاک کردن zip اصلی بعد از split
         else:
-            parts = split_video_playable(file_path, save_dir, segment_duration=chunk_dur)
+            parts = split_video_by_size(file_path, save_dir, max_size_bytes=settings.MAX_CHUNK_SIZE)
 
         if not parts:
             send_message(chat_id, "❌ آماده‌سازی فایل برای ارسال ناموفق بود.")
             safe_remove(save_dir)
             return
 
-        state_file = f"data/upload_state_{job['id']}.json"
+        state_file = os.path.join(DATA_DIR, f"upload_state_{job['id']}.json")
 
-        def __send_doc(chat_id_int: int, fpath: str, caption: str) -> bool:
+        def _send_doc(chat_id_int: int, fpath: str, caption: str) -> bool:
             return send_document(chat_id_int, fpath, caption)
 
-        success = upload_manager(parts, chat_id, __send_doc, state_file, max_retries=3)
+        success = upload_manager(parts, chat_id, _send_doc, state_file, max_retries=3)
         if success:
             send_message(chat_id, f"✅ ویدئو با موفقیت آپلود شد. روش: {method_used}")
         else:
@@ -451,144 +451,35 @@ def process_job(job: dict) -> None:
 
         safe_remove(save_dir)
 
-    elif cmd == "batch_download":
-        with last_search_lock:
-            results = last_search.get("results", [])
-        if not results:
-            send_message(chat_id, "❌ نتایج جستجویی برای دانلود موجود نیست.")
-            return
-        for vid in results:
-            dl_job = {
-                "command": "download",
-                "video_id": vid["video_id"],
-                "chat_id": chat_id,
-                "chain": get_enabled_chain("download"),
-            }
-            enqueue_job(dl_job)
-
 
 # -------------------------------------------------------------------
-# مدیریت callback
+# مدیریت callbackها
 # -------------------------------------------------------------------
 def handle_callback(chat_id: int, data: str, message_id: int, callback_query_id: str) -> None:
-    answer_callback_query(callback_query_id)
+    """پردازش callbackهای inline."""
+    if not is_admin(chat_id):
+        answer_callback_query(callback_query_id, "⛔ دسترسی ندارید.")
+        return
 
+    answer_callback_query(callback_query_id)
     parts = data.split("|")
     action = parts[0]
 
-    if action == "search":
-        user_state[chat_id] = "awaiting_query"
+    if action == "main_menu":
+        send_message(chat_id, "منوی اصلی", reply_markup=build_main_menu())
+
+    elif action == "search":
+        with user_state_lock:
+            user_state[chat_id] = "awaiting_query"
         send_message(chat_id, "🔍 لطفاً عبارت جستجو را وارد کنید.")
 
     elif action == "download_link":
-        user_state[chat_id] = "awaiting_url"
+        with user_state_lock:
+            user_state[chat_id] = "awaiting_url"
         send_message(chat_id, "📥 لطفاً لینک یوتیوب را ارسال کنید.")
 
-    elif action == "info":
-        video_id = parts[1]
-        method_used = parts[2] if len(parts) > 2 else ""
-        job = {
-            "command": "info",
-            "video_id": video_id,
-            "chat_id": chat_id,
-            "chain": settings.DEFAULT_INFO_CHAIN,
-        }
-        enqueue_job(job)
-
-    elif action == "dl":
-        video_id = parts[1]
-        method_used = parts[2] if len(parts) > 2 else ""
-        job = {
-            "command": "download",
-            "video_id": video_id,
-            "chat_id": chat_id,
-            "chain": get_enabled_chain("download"),
-        }
-        enqueue_job(job)
-
-    elif action == "thumb":
-        video_id = parts[1]
-        try:
-            thumb_path, _ = youtube_core.download_thumbnail(video_id, "downloads")
-            if thumb_path:
-                send_document(chat_id, thumb_path, caption="تصویر بند‌انگشتی")
-                safe_remove(thumb_path)
-            else:
-                send_message(chat_id, "❌ دریافت تامنیل ناموفق بود.")
-        except Exception as e:
-            _log.error(f"Thumb callback error: {e}")
-
-    elif action == "page":
-        page = int(parts[1])
-        with last_search_lock:
-            results = last_search.get("results", [])
-            method_used = last_search.get("method_used", "")
-            query = last_search.get("query", "")
-        if not results:
-            send_message(chat_id, "❌ نتایج جستجو منقضی شده است.")
-            return
-        limit = method_config.get("result_page_size", 5)
-        total_pages = (len(results) + limit - 1) // limit
-        page = max(0, min(page, total_pages - 1))
-        keyboard = build_search_keyboard(results, page, total_pages, method_used)
-        header = f"🔍 نتایج جستجو برای: {query}\nروش: {method_used}\nصفحه {page+1} از {total_pages}"
-        edit_message_text(chat_id, message_id, header, reply_markup=keyboard)
-
-    elif action == "next_search":
-        method_used = parts[1]
-        with last_search_lock:
-            query = last_search.get("query", "")
-            chain = last_search.get("chain", get_enabled_chain("search"))
-        if not query:
-            send_message(chat_id, "❌ اطلاعات جستجو نامعتبر است.")
-            return
-        try:
-            idx = chain.index(method_used)
-            next_method = chain[idx+1] if idx+1 < len(chain) else None
-        except ValueError:
-            next_method = None
-        if not next_method:
-            send_message(chat_id, "⛔ تمام متدها امتحان شدند.")
-            return
-        job = {
-            "command": "search",
-            "query": query,
-            "limit": method_config.get("result_page_size", 5),
-            "chain": chain,
-            "start_method": next_method,
-            "chat_id": chat_id,
-        }
-        enqueue_job(job)
-
-    elif action == "next_info":
-        # 🔧 اصلاح: حالا video_id از callback گرفته می‌شود
-        video_id = parts[1]
-        method_used = parts[2]
-        chain = settings.DEFAULT_INFO_CHAIN
-        try:
-            idx = chain.index(method_used)
-            next_method = chain[idx+1] if idx+1 < len(chain) else None
-        except ValueError:
-            next_method = None
-        if not next_method:
-            send_message(chat_id, "⛔ تمام متدهای اطلاعات امتحان شدند.")
-            return
-        job = {
-            "command": "info",
-            "video_id": video_id,
-            "chat_id": chat_id,
-            "chain": chain,
-            "start_method": next_method,
-        }
-        enqueue_job(job)
-
-    elif action == "batch_dl":
-        job = {"command": "batch_download", "chat_id": chat_id}
-        enqueue_job(job)
-
     elif action == "settings":
-        keyboard = build_settings_menu()
-        send_message(chat_id, "⚙️ تنظیمات", reply_markup=keyboard)
+        send_message(chat_id, "⚙️ تنظیمات", reply_markup=build_settings_menu())
 
     elif action == "settings_chain":
         category = parts[1]
@@ -620,7 +511,7 @@ def handle_callback(chat_id: int, data: str, message_id: int, callback_query_id:
         category = parts[1]
         with method_config_lock:
             save_method_config(method_config)
-        answer_callback_query(callback_query_id, text="ذخیره شد.")
+        answer_callback_query(callback_query_id, "تنظیمات ذخیره شد.")
         send_message(chat_id, "تنظیمات ذخیره شد.", reply_markup=build_settings_menu())
 
     elif action == "settings_upload_mode":
@@ -629,7 +520,29 @@ def handle_callback(chat_id: int, data: str, message_id: int, callback_query_id:
             new_mode = "zip" if current == "playable_chunks" else "playable_chunks"
             method_config["upload_mode"] = new_mode
             save_method_config(method_config)
-        answer_callback_query(callback_query_id, text=f"حالت آپلود: {new_mode}")
+        answer_callback_query(callback_query_id, f"حالت آپلود: {new_mode}")
+
+    elif action == "settings_quality":
+        keyboard = build_quality_keyboard()
+        send_message(chat_id, "🎚️ کیفیت دانلود را انتخاب کنید:", reply_markup=keyboard)
+
+    elif action == "quality_set":
+        quality = parts[1]
+        with method_config_lock:
+            method_config["download_quality"] = quality
+            save_method_config(method_config)
+        answer_callback_query(callback_query_id, f"کیفیت: {quality}")
+        # به‌روزرسانی کیبورد
+        new_keyboard = build_quality_keyboard()
+        edit_reply_markup(chat_id, message_id, new_keyboard)
+
+    elif action == "settings_search_mode":
+        with method_config_lock:
+            current = method_config.get("search_mode", "browser")
+            new_mode = "api" if current == "browser" else "browser"
+            method_config["search_mode"] = new_mode
+            save_method_config(method_config)
+        answer_callback_query(callback_query_id, f"حالت جستجو: {new_mode}")
 
     elif action == "settings_page_size":
         sizes = [5, 10, 15]
@@ -642,19 +555,17 @@ def handle_callback(chat_id: int, data: str, message_id: int, callback_query_id:
                 new_size = 5
             method_config["result_page_size"] = new_size
             save_method_config(method_config)
-        answer_callback_query(callback_query_id, text=f"تعداد نتایج: {new_size}")
-
-    elif action == "main_menu":
-        send_message(chat_id, "منوی اصلی", reply_markup=build_main_menu())
+        answer_callback_query(callback_query_id, f"تعداد نتایج: {new_size}")
 
     elif action == "help":
         help_text = (
-            "🤖 ربات دانلودر یوتیوب\n\n"
+            "🤖 ربات دانلودر یوتیوب (نسخه ۳)\n\n"
+            "دستورات:\n"
             "🔍 جستجو: عبارت خود را بفرستید.\n"
             "📥 دانلود با لینک: لینک ویدئو را بفرستید.\n"
-            "⚙️ تنظیمات: متدهای دانلود/جستجو، حالت آپلود و تعداد نتایج.\n"
-            "📄 دریافت لاگ: فایل bot.log ارسال می‌شود.\n\n"
-            "روش‌ها: hubytconvert (پیش‌فرض)، y2mate و ... با قابلیت تعویض زنجیره."
+            "/H{کد} – اطلاعات کامل ویدئو\n"
+            "/Download_{کد} – دانلود ویدئو\n\n"
+            "⚙️ تنظیمات: حالت جستجو (browser/api)، کیفیت، زنجیرهٔ دانلود و ..."
         )
         send_message(chat_id, help_text, reply_markup=build_main_menu())
 
@@ -669,60 +580,98 @@ def handle_callback(chat_id: int, data: str, message_id: int, callback_query_id:
 # مدیریت پیام‌های متنی
 # -------------------------------------------------------------------
 def handle_message(chat_id: int, text: str) -> None:
-    if text.startswith("/start"):
-        send_message(chat_id, "به ربات یوتیوب خوش آمدید.", reply_markup=build_main_menu())
+    """پردازش پیام متنی ورودی."""
+    if not is_admin(chat_id):
+        send_message(chat_id, "⛔ دسترسی ندارید.")
         return
+
+    # دستورات اسلش
+    if text.startswith("/start"):
+        send_message(chat_id, "به ربات یوتیوب خوش آمدید. 🎬", reply_markup=build_main_menu())
+        return
+
     if text.startswith("/help"):
         handle_callback(chat_id, "help", 0, "0")
         return
+
     if text.startswith("/log"):
         handle_callback(chat_id, "log", 0, "0")
         return
 
-    state = user_state.get(chat_id)
+    # بررسی دستورات H (اطلاعات)
+    match_h = re.match(r'^/H([a-f0-9]+)$', text, re.IGNORECASE)
+    if match_h:
+        code = match_h.group(1).lower()
+        with cmd_map_lock:
+            video_id = cmd_map.get(code)
+        if video_id:
+            enqueue_job({"command": "info", "video_id": video_id, "chat_id": chat_id})
+            send_message(chat_id, f"⏳ دریافت اطلاعات برای /H{code} ...")
+        else:
+            send_message(chat_id, "❌ فرمان نامعتبر (کد یافت نشد).")
+        return
+
+    # بررسی دستورات Download_
+    match_dl = re.match(r'^/Download_([a-f0-9]+)$', text, re.IGNORECASE)
+    if match_dl:
+        code = match_dl.group(1).lower()
+        with cmd_map_lock:
+            video_id = cmd_map.get(code)
+        if video_id:
+            enqueue_job({"command": "download", "video_id": video_id, "chat_id": chat_id})
+            send_message(chat_id, f"⏳ دانلود /Download_{code} شروع شد...")
+        else:
+            send_message(chat_id, "❌ فرمان نامعتبر (کد یافت نشد).")
+        return
+
+    # بررسی state کاربر
+    with user_state_lock:
+        state = user_state.get(chat_id)
+
     if state == "awaiting_query":
-        limit = method_config.get("result_page_size", 5)
-        chain = get_enabled_chain("search")
-        job = {
+        enqueue_job({
             "command": "search",
             "query": text,
-            "limit": limit,
-            "chain": chain,
+            "mode": method_config.get("search_mode", "browser"),
             "chat_id": chat_id,
-        }
-        enqueue_job(job)
-        user_state[chat_id] = None
+        })
+        with user_state_lock:
+            user_state[chat_id] = None
         send_message(chat_id, "⏳ در حال جستجو...")
+        return
 
-    elif state == "awaiting_url":
+    if state == "awaiting_url":
         vid = extract_video_id(text)
         if not vid:
-            send_message(chat_id, "❌ لینک یوتیوب معتبر نیست.")
+            send_message(chat_id, "❌ لینک یوتیوب معتبر نیست. لطفاً یک لینک معتبر ارسال کنید.")
             return
-        job = {
-            "command": "info",
-            "video_id": vid,
-            "chain": settings.DEFAULT_INFO_CHAIN,
-            "chat_id": chat_id,
-        }
-        enqueue_job(job)
-        user_state[chat_id] = None
-        send_message(chat_id, "⏳ در حال دریافت اطلاعات...")
-    else:
-        pass
+        enqueue_job({"command": "info", "video_id": vid, "chat_id": chat_id})
+        with user_state_lock:
+            user_state[chat_id] = None
+        send_message(chat_id, "⏳ دریافت اطلاعات...")
+        return
+
+    # در غیر این صورت، نادیده گرفته می‌شود
+    pass
 
 
 # -------------------------------------------------------------------
 # حلقهٔ اصلی
 # -------------------------------------------------------------------
 def main() -> None:
-    global method_config
-    _log.info("Bot starting...")
-    method_config = load_method_config()
+    global method_config, cmd_map
 
+    _log.info("Bot starting...")
+
+    # بارگذاری تنظیمات و cmd_map
+    method_config = load_method_config()
+    cmd_map = load_cmd_map()
+
+    # راه‌اندازی worker
     worker = threading.Thread(target=worker_loop, daemon=True)
     worker.start()
 
+    # حلقهٔ long‑polling
     offset = 0
     while True:
         try:
@@ -733,6 +682,7 @@ def main() -> None:
                     msg = upd["message"]
                     chat_id = msg["chat"]["id"]
                     if "text" in msg:
+                        # پردازش در همان thread (ترتیبی) برای سادگی
                         handle_message(chat_id, msg["text"])
                 elif "callback_query" in upd:
                     cb = upd["callback_query"]
